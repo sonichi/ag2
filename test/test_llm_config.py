@@ -21,6 +21,9 @@ from autogen.oai.groq import GroqLLMConfigEntry
 from autogen.oai.mistral import MistralLLMConfigEntry
 from autogen.oai.ollama import OllamaLLMConfigEntry
 from autogen.oai.together import TogetherLLMConfigEntry
+from autogen.oai.client import OpenAIWrapper, ModelClient # Added OpenAIWrapper and ModelClient
+
+from unittest.mock import MagicMock, patch
 
 JSON_SAMPLE = """
 [
@@ -851,3 +854,314 @@ class TestLLMConfig:
                     assert LLMConfig.get_current_llm_config() == llm_config.where(api_type="openai", model="gpt-4")
                     assert LLMConfig.current == llm_config.where(api_type="openai", model="gpt-4")
                     assert LLMConfig.default == llm_config.where(api_type="openai", model="gpt-4")
+
+    def test_routing_method_initialization(self):
+        config_list_data = [{"model": "gpt-4", "api_key": "sk-test"}]
+        llm_config_default = LLMConfig(config_list=config_list_data)
+        assert llm_config_default.routing_method == "fixed_order"
+        assert llm_config_default._config_list_index == 0
+
+        llm_config_round_robin = LLMConfig(config_list=config_list_data, routing_method="round_robin")
+        assert llm_config_round_robin.routing_method == "round_robin"
+        assert llm_config_round_robin._config_list_index == 0
+
+        llm_config_explicit_fixed = LLMConfig(config_list=config_list_data, routing_method="fixed_order")
+        assert llm_config_explicit_fixed.routing_method == "fixed_order"
+        assert llm_config_explicit_fixed._config_list_index == 0
+
+    def test_get_configs_to_try_fixed_order(self):
+        entry1 = OpenAILLMConfigEntry(model="gpt-4", api_key="sk-test1")
+        entry2 = OpenAILLMConfigEntry(model="gpt-3.5", api_key="sk-test2")
+        llm_config = LLMConfig(config_list=[entry1, entry2], routing_method="fixed_order")
+
+        configs_to_try = llm_config.get_configs_to_try()
+        assert configs_to_try == [entry1, entry2]
+        # Ensure index is not advanced for fixed_order
+        assert llm_config._config_list_index == 0
+
+        # Try again, should be the same
+        configs_to_try_again = llm_config.get_configs_to_try()
+        assert configs_to_try_again == [entry1, entry2]
+        assert llm_config._config_list_index == 0
+
+    def test_get_configs_to_try_round_robin(self):
+        entry1 = OpenAILLMConfigEntry(model="gpt-4", api_key="sk-test1")
+        entry2 = OpenAILLMConfigEntry(model="gpt-3.5", api_key="sk-test2")
+        entry3 = OpenAILLMConfigEntry(model="gpt-4o", api_key="sk-test3")
+        llm_config = LLMConfig(config_list=[entry1, entry2, entry3], routing_method="round_robin")
+
+        # First call
+        configs_to_try1 = llm_config.get_configs_to_try()
+        assert configs_to_try1 == [entry1]
+        assert llm_config._config_list_index == 1
+
+        # Second call
+        configs_to_try2 = llm_config.get_configs_to_try()
+        assert configs_to_try2 == [entry2]
+        assert llm_config._config_list_index == 2
+
+        # Third call
+        configs_to_try3 = llm_config.get_configs_to_try()
+        assert configs_to_try3 == [entry3]
+        assert llm_config._config_list_index == 0 # Should wrap around
+
+        # Fourth call (back to first)
+        configs_to_try4 = llm_config.get_configs_to_try()
+        assert configs_to_try4 == [entry1]
+        assert llm_config._config_list_index == 1
+
+    def test_get_configs_to_try_round_robin_single_config(self):
+        entry1 = OpenAILLMConfigEntry(model="gpt-4", api_key="sk-test1")
+        llm_config = LLMConfig(config_list=[entry1], routing_method="round_robin")
+
+        configs_to_try1 = llm_config.get_configs_to_try()
+        assert configs_to_try1 == [entry1]
+        assert llm_config._config_list_index == 0
+
+        configs_to_try2 = llm_config.get_configs_to_try()
+        assert configs_to_try2 == [entry1]
+        assert llm_config._config_list_index == 0
+
+    def test_get_configs_to_try_empty_list(self):
+        llm_config_fixed = LLMConfig(config_list=[], routing_method="fixed_order")
+        assert llm_config_fixed.get_configs_to_try() == []
+
+        llm_config_round_robin = LLMConfig(config_list=[], routing_method="round_robin")
+        assert llm_config_round_robin.get_configs_to_try() == []
+
+    def test_get_configs_to_try_unknown_method(self):
+        entry1 = OpenAILLMConfigEntry(model="gpt-4", api_key="sk-test1")
+        llm_config = LLMConfig(config_list=[entry1], routing_method="unknown_method")
+        # Should default to fixed_order behavior
+        configs_to_try = llm_config.get_configs_to_try()
+        assert configs_to_try == [entry1]
+        assert llm_config._config_list_index == 0 # Index should not advance
+
+    def test_where_resets_round_robin_index(self):
+        entry1 = OpenAILLMConfigEntry(model="gpt-4", api_key="sk-key1", tags=["a"])
+        entry2 = OpenAILLMConfigEntry(model="gpt-3.5", api_key="sk-key2", tags=["b"])
+        entry3 = OpenAILLMConfigEntry(model="gpt-4o", api_key="sk-key3", tags=["a"])
+        llm_config_orig = LLMConfig(config_list=[entry1, entry2, entry3], routing_method="round_robin")
+
+        # Advance index on original
+        llm_config_orig.get_configs_to_try() # entry1, index becomes 1
+        llm_config_orig.get_configs_to_try() # entry2, index becomes 2
+        assert llm_config_orig._config_list_index == 2
+
+        # Filter
+        llm_config_filtered = llm_config_orig.where(tags=["a"])
+        assert len(llm_config_filtered.config_list) == 2
+        assert llm_config_filtered.config_list[0].model == "gpt-4"
+        assert llm_config_filtered.config_list[1].model == "gpt-4o"
+
+        # Check that the new LLMConfig from where() has its index reset
+        assert llm_config_filtered.routing_method == "round_robin" # routing_method should be preserved
+        assert llm_config_filtered._config_list_index == 0 # Index should be reset for the new object
+
+        # Test round robin on the filtered list
+        configs1 = llm_config_filtered.get_configs_to_try()
+        assert len(configs1) == 1
+        assert configs1[0].model == "gpt-4"
+        assert llm_config_filtered._config_list_index == 1
+
+        configs2 = llm_config_filtered.get_configs_to_try()
+        assert len(configs2) == 1
+        assert configs2[0].model == "gpt-4o"
+        assert llm_config_filtered._config_list_index == 0 # Wraps around in the filtered list
+
+        # Original config's index should be unchanged by operations on the filtered one
+        assert llm_config_orig._config_list_index == 2
+
+
+class TestOpenAIWrapperRouting:
+    def _create_mock_client(self, name: str, succeed: bool = True):
+        client = MagicMock(spec=ModelClient)
+        client.name = name
+        if succeed:
+            client.create.return_value = MagicMock(spec=ModelClient.ModelClientResponseProtocol)
+            client.create.return_value.choices = [MagicMock()]
+            client.create.return_value.choices[0].message = MagicMock(content="success from " + name)
+            client.create.return_value.model = name
+            client.cost.return_value = 0.01
+            client.get_usage.return_value = {
+                "prompt_tokens": 10,
+                "completion_tokens": 10,
+                "total_tokens": 20,
+                "cost": 0.01,
+                "model": name,
+            }
+            # Mock message_retrieval_function
+            client.create.return_value.message_retrieval_function = lambda x: [choice.message for choice in x.choices]
+
+        else:
+            client.create.side_effect = Exception(f"Failed to create from {name}")
+        return client
+
+    def test_openai_wrapper_routing_method_init(self):
+        config_list = [{"model": "gpt-4", "api_key": "sk-1"}]
+        wrapper_default = OpenAIWrapper(config_list=config_list)
+        assert wrapper_default.routing_method == "fixed_order"
+        assert wrapper_default._current_client_index == 0
+
+        wrapper_round_robin = OpenAIWrapper(config_list=config_list, routing_method="round_robin")
+        assert wrapper_round_robin.routing_method == "round_robin"
+        assert wrapper_round_robin._current_client_index == 0
+
+        wrapper_fixed_explicit = OpenAIWrapper(config_list=config_list, routing_method="fixed_order")
+        assert wrapper_fixed_explicit.routing_method == "fixed_order"
+        assert wrapper_fixed_explicit._current_client_index == 0
+
+    @patch("autogen.oai.client.OpenAIClient") # Mock the actual client creation
+    def test_openai_wrapper_fixed_order_routing(self, MockOpenAIClient):
+        # This test checks that fixed_order tries clients sequentially on failure.
+        mock_oai_client_instance_good = self._create_mock_client("good_client", succeed=True)
+        mock_oai_client_instance_bad = self._create_mock_client("bad_client", succeed=False)
+
+        # Order of mock return values matters for sequential client registration
+        MockOpenAIClient.side_effect = [
+            mock_oai_client_instance_bad,  # First client will fail
+            mock_oai_client_instance_good  # Second client will succeed
+        ]
+
+        config_list = [
+            {"model": "bad_model", "api_key": "sk-bad"}, # Will be associated with bad_client
+            {"model": "good_model", "api_key": "sk-good"} # Will be associated with good_client
+        ]
+
+        wrapper = OpenAIWrapper(config_list=config_list, routing_method="fixed_order")
+
+        # First client is bad_client, second is good_client due to side_effect order
+        assert wrapper._clients[0] == mock_oai_client_instance_bad
+        assert wrapper._clients[1] == mock_oai_client_instance_good
+
+        response = wrapper.create(messages=[{"role": "user", "content": "hello"}])
+
+        assert response.model == "good_client" # Should succeed with the second client
+        mock_oai_client_instance_bad.create.assert_called_once() # First client was called
+        mock_oai_client_instance_good.create.assert_called_once() # Second client was called
+        assert wrapper._current_client_index == 0 # Index not used/advanced in fixed_order like this
+
+    @patch("autogen.oai.client.OpenAIClient")
+    def test_openai_wrapper_round_robin_routing_success_first_attempt(self, MockOpenAIClient):
+        # This test checks round_robin cycles the starting client on successive calls,
+        # and the first attempt (which is the round-robin selected client) succeeds.
+        mock_client1 = self._create_mock_client("client1", succeed=True)
+        mock_client2 = self._create_mock_client("client2", succeed=True)
+        MockOpenAIClient.side_effect = [mock_client1, mock_client2] # For initializing OpenAIWrapper
+
+        config_list = [
+            {"model": "model1", "api_key": "sk-1"}, # Associated with client1
+            {"model": "model2", "api_key": "sk-2"}  # Associated with client2
+        ]
+        wrapper = OpenAIWrapper(config_list=config_list, routing_method="round_robin")
+        # wrapper._clients will be [mock_client1, mock_client2]
+
+        # Call 1 - starting index 0 (client1). client1 succeeds.
+        response1 = wrapper.create(messages=[{"role": "user", "content": "hello"}])
+        assert response1.model == "client1"
+        mock_client1.create.assert_called_once()
+        mock_client2.create.assert_not_called() # client2 not called as client1 succeeded
+        assert wrapper._current_client_index == 1 # Next call will start with client2
+
+        # Call 2 - starting index 1 (client2). client2 succeeds.
+        mock_client1.reset_mock()
+        response2 = wrapper.create(messages=[{"role": "user", "content": "world"}])
+        assert response2.model == "client2"
+        mock_client1.create.assert_not_called() # client1 not called this round
+        mock_client2.create.assert_called_once()
+        assert wrapper._current_client_index == 0 # Next call will start with client1 (wraps around)
+
+        # Call 3 - starting index 0 (client1). client1 succeeds.
+        mock_client2.reset_mock()
+        response3 = wrapper.create(messages=[{"role": "user", "content": "again"}])
+        assert response3.model == "client1"
+        mock_client1.create.assert_called_once()
+        mock_client2.create.assert_not_called()
+        assert wrapper._current_client_index == 1
+
+    @patch("autogen.oai.client.OpenAIClient")
+    def test_openai_wrapper_round_robin_failover(self, MockOpenAIClient):
+        # This test checks that round_robin attempts failover starting from the round-robin index.
+        mock_client1_fails = self._create_mock_client("client1_fails", succeed=False)
+        mock_client2_succeeds = self._create_mock_client("client2_succeeds", succeed=True)
+        mock_client3_succeeds = self._create_mock_client("client3_succeeds", succeed=True)
+
+        # This side_effect is for when OpenAIWrapper initializes its internal _clients list
+        MockOpenAIClient.side_effect = [mock_client1_fails, mock_client2_succeeds, mock_client3_succeeds]
+
+        config_list = [
+            {"model": "model1", "api_key": "sk-1"}, # client1_fails
+            {"model": "model2", "api_key": "sk-2"}, # client2_succeeds
+            {"model": "model3", "api_key": "sk-3"}  # client3_succeeds
+        ]
+        wrapper = OpenAIWrapper(config_list=config_list, routing_method="round_robin")
+        assert wrapper._clients == [mock_client1_fails, mock_client2_succeeds, mock_client3_succeeds]
+
+        # --- First Create Call ---
+        # Starts at index 0 (client1_fails). Expected order of attempts: client1_fails -> client2_succeeds
+        wrapper._current_client_index = 0
+        response1 = wrapper.create(messages=[{"role": "user", "content": "try1"}])
+        assert response1.model == "client2_succeeds" # Succeeds with client2
+        mock_client1_fails.create.assert_called_once() # client1 attempted and failed
+        mock_client2_succeeds.create.assert_called_once() # client2 attempted and succeeded
+        mock_client3_succeeds.create.assert_not_called() # client3 not needed
+        assert wrapper._current_client_index == 1 # Next call will start at index 1
+
+        # Reset mocks for next call
+        mock_client1_fails.reset_mock()
+        mock_client2_succeeds.reset_mock()
+        mock_client3_succeeds.reset_mock()
+
+        # --- Second Create Call ---
+        # Starts at index 1 (client2_succeeds). Expected order of attempts: client2_succeeds
+        # wrapper._current_client_index is already 1
+        response2 = wrapper.create(messages=[{"role": "user", "content": "try2"}])
+        assert response2.model == "client2_succeeds" # Succeeds with client2 immediately
+        mock_client1_fails.create.assert_not_called()
+        mock_client2_succeeds.create.assert_called_once()
+        mock_client3_succeeds.create.assert_not_called()
+        assert wrapper._current_client_index == 2 # Next call will start at index 2
+
+        # Reset mocks
+        mock_client1_fails.reset_mock()
+        mock_client2_succeeds.reset_mock()
+        mock_client3_succeeds.reset_mock()
+
+        # --- Third Create Call ---
+        # Starts at index 2 (client3_succeeds). Expected order of attempts: client3_succeeds -> client1_fails -> client2_succeeds
+        # For this, let's make client3 also fail to test full wrap-around logic
+        mock_client3_succeeds.create.side_effect = Exception("Failed from client3_succeeds temporarily")
+        mock_client3_succeeds.succeed = False # for clarity in debugging if needed, though side_effect is key
+
+        # client1_fails is already set to fail.
+        # client2_succeeds is set to succeed.
+
+        # wrapper._current_client_index is already 2
+        response3 = wrapper.create(messages=[{"role": "user", "content": "try3"}])
+        assert response3.model == "client2_succeeds" # Should eventually succeed with client2
+
+        mock_client3_succeeds.create.assert_called_once() # client3 (start) attempted and failed
+        mock_client1_fails.create.assert_called_once()    # client1 (wrap around) attempted and failed
+        mock_client2_succeeds.create.assert_called_once() # client2 (wrap around) attempted and succeeded
+        assert wrapper._current_client_index == 0 # Next call will start at index 0
+
+    @patch("autogen.oai.client.OpenAIClient")
+    def test_openai_wrapper_round_robin_all_fail(self, MockOpenAIClient):
+        # This test checks that if all clients fail in round_robin, the error from the last-tried client propagates.
+        mock_client1_fails = self._create_mock_client("client1_fails", succeed=False)
+        mock_client2_fails = self._create_mock_client("client2_fails", succeed=False)
+        MockOpenAIClient.side_effect = [mock_client1_fails, mock_client2_fails]
+
+        config_list = [
+            {"model": "model1", "api_key": "sk-1"},
+            {"model": "model2", "api_key": "sk-2"}
+        ]
+        wrapper = OpenAIWrapper(config_list=config_list, routing_method="round_robin")
+
+        wrapper._current_client_index = 0 # Start with client1_fails
+        with pytest.raises(Exception, match="Failed to create from client2_fails"): # Error from last client in sequence client1->client2
+            wrapper.create(messages=[{"role": "user", "content": "hello"}])
+
+        mock_client1_fails.create.assert_called_once()
+        mock_client2_fails.create.assert_called_once()
+        assert wrapper._current_client_index == 1 # Index advanced for next create call.

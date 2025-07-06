@@ -764,6 +764,7 @@ class OpenAIWrapper:
         self,
         *,
         config_list: Optional[list[dict[str, Any]]] = None,
+        routing_method: str = "fixed_order",
         **base_config: Any,
     ):
         """Initialize the OpenAIWrapper.
@@ -805,6 +806,8 @@ class OpenAIWrapper:
 
         self._clients: list[ModelClient] = []
         self._config_list: list[dict[str, Any]] = []
+        self.routing_method = routing_method
+        self._current_client_index: int = 0
 
         if config_list:
             config_list = [config.copy() for config in config_list]  # make a copy before modifying
@@ -1065,7 +1068,6 @@ class OpenAIWrapper:
         # if ERROR:
         #     raise ERROR
         invocation_id = str(uuid.uuid4())
-        last = len(self._clients) - 1
         # Check if all configs in config list are activated
         non_activated = [
             client.config["model_client_cls"] for client in self._clients if isinstance(client, PlaceHolderClient)
@@ -1074,7 +1076,27 @@ class OpenAIWrapper:
             raise RuntimeError(
                 f"Model client(s) {non_activated} are not activated. Please register the custom model clients using `register_model_client` or filter them out form the config list."
             )
-        for i, client in enumerate(self._clients):
+
+        client_indices_to_try: list[int]
+        num_clients = len(self._clients)
+
+        if self.routing_method == "round_robin":
+            if not hasattr(self, "_current_client_index"): # Should have been initialized in __init__
+                self._current_client_index = 0
+            start_index = self._current_client_index
+            # Create a list of indices to try, starting from start_index and wrapping around
+            client_indices_to_try = [ (start_index + j) % num_clients for j in range(num_clients) ]
+            # Advance the main round-robin index for the *next* create call
+            self._current_client_index = (start_index + 1) % num_clients
+        elif self.routing_method == "fixed_order":
+            client_indices_to_try = list(range(num_clients))
+        else: # Default or unknown routing method
+            logger.warning(f"Unknown routing_method: {self.routing_method}. Defaulting to fixed_order.")
+            client_indices_to_try = list(range(num_clients))
+
+        last_error = None
+        for i in client_indices_to_try:
+            client = self._clients[i]
             # merge the input config with the i-th config in the config list
             full_config = {**config, **self._config_list[i]}
             # separate the config into create_config and extra_kwargs
@@ -1113,7 +1135,7 @@ class OpenAIWrapper:
             log_cache_seed_value(cache if cache is not None else cache_seed, client=client)
 
             if cache_client is not None:
-                with cache_client as cache:
+                with cache_client as cache_instance: # Renamed to avoid conflict with outer 'cache' variable
                     # Try to get the response from cache
                     key = get_key(
                         {
@@ -1125,7 +1147,7 @@ class OpenAIWrapper:
                     )
                     request_ts = get_current_ts()
 
-                    response: ModelClient.ModelClientResponseProtocol = cache.get(key, None)
+                    response: ModelClient.ModelClientResponseProtocol = cache_instance.get(key, None)
 
                     if response is not None:
                         response.message_retrieval_function = client.message_retrieval
@@ -1134,12 +1156,10 @@ class OpenAIWrapper:
                         except AttributeError:
                             # update attribute if cost is not calculated
                             response.cost = client.cost(response)
-                            cache.set(key, response)
+                            cache_instance.set(key, response)
                         total_usage = client.get_usage(response)
 
                         if logging_enabled():
-                            # Log the cache hit
-                            # TODO: log the config_id and pass_filter etc.
                             log_chat_completion(
                                 invocation_id=invocation_id,
                                 client_id=id(client),
@@ -1152,26 +1172,26 @@ class OpenAIWrapper:
                                 start_time=request_ts,
                             )
 
-                        # check the filter
                         pass_filter = filter_func is None or filter_func(context=context, response=response)
-                        if pass_filter or i == last:
-                            # Return the response if it passes the filter or it is the last client
+                        if pass_filter or i == client_indices_to_try[-1]: # If it's the last one to try in this routing attempt
                             response.config_id = i
                             response.pass_filter = pass_filter
                             self._update_usage(actual_usage=actual_usage, total_usage=total_usage)
                             return response
-                        continue  # filter is not passed; try the next config
+                        last_error = RuntimeError(f"Cache hit for config {i} but failed filter_func.")
+                        continue
             try:
                 request_ts = get_current_ts()
                 response = client.create(params)
             except Exception as e:
+                last_error = e
                 if openai_result.is_successful:
                     if APITimeoutError is not None and isinstance(e, APITimeoutError):
-                        # logger.debug(f"config {i} timed out", exc_info=True)
-                        if i == last:
+                        if i == client_indices_to_try[-1]:
                             raise TimeoutError(
                                 "OpenAI API call timed out. This could be due to congestion or too small a timeout value. The timeout can be specified by setting the 'timeout' value (in seconds) in the llm_config (if you are using agents) or the OpenAIWrapper constructor (if you are using the OpenAIWrapper directly)."
                             ) from e
+                        continue # Try next client if not the last one for this routing method
                     elif APIError is not None and isinstance(e, APIError):
                         error_code = getattr(e, "code", None)
                         if logging_enabled():
@@ -1186,18 +1206,18 @@ class OpenAIWrapper:
                                 cost=0,
                                 start_time=request_ts,
                             )
-
                         if error_code == "content_filter":
-                            # raise the error for content_filter
-                            raise
-                        # logger.debug(f"config {i} failed", exc_info=True)
-                        if i == last:
-                            raise
+                            raise # Re-raise content filter errors immediately
+                        if i == client_indices_to_try[-1]:
+                            raise # Re-raise if last attempt
+                        continue
                     else:
-                        raise
-                else:
-                    raise
-            except (
+                        if i == client_indices_to_try[-1]: raise
+                        continue
+                else: # Not an openai_result.is_successful case
+                    if i == client_indices_to_try[-1]: raise
+                    continue
+            except ( # Other specific API errors
                 gemini_InternalServerError,
                 gemini_ResourceExhausted,
                 anthorpic_InternalServerError,
@@ -1218,12 +1238,12 @@ class OpenAIWrapper:
                 cerebras_AuthenticationError,
                 cerebras_InternalServerError,
                 cerebras_RateLimitError,
-            ):
-                # logger.debug(f"config {i} failed", exc_info=True)
-                if i == last:
+            ) as e:
+                last_error = e
+                if i == client_indices_to_try[-1]:
                     raise
-            else:
-                # add cost calculation before caching no matter filter is passed or not
+                continue
+            else: # Success case
                 if price is not None:
                     response.cost = self._cost_with_customized_price(response, price)
                 else:
@@ -1233,12 +1253,10 @@ class OpenAIWrapper:
                 self._update_usage(actual_usage=actual_usage, total_usage=total_usage)
 
                 if cache_client is not None:
-                    # Cache the response
-                    with cache_client as cache:
-                        cache.set(key, response)
+                    with cache_client as cache_instance: # Renamed
+                        cache_instance.set(key, response)
 
                 if logging_enabled():
-                    # TODO: log the config_id and pass_filter etc.
                     log_chat_completion(
                         invocation_id=invocation_id,
                         client_id=id(client),
@@ -1252,15 +1270,17 @@ class OpenAIWrapper:
                     )
 
                 response.message_retrieval_function = client.message_retrieval
-                # check the filter
                 pass_filter = filter_func is None or filter_func(context=context, response=response)
-                if pass_filter or i == last:
-                    # Return the response if it passes the filter or it is the last client
+                if pass_filter or i == client_indices_to_try[-1]:
                     response.config_id = i
                     response.pass_filter = pass_filter
                     return response
-                continue  # filter is not passed; try the next config
-        raise RuntimeError("Should not reach here.")
+                last_error = RuntimeError(f"Successful call for config {i} but failed filter_func.")
+                continue
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Should not reach here. No clients were tried or all failed without raising.")
 
     @staticmethod
     def _cost_with_customized_price(

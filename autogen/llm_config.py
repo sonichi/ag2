@@ -82,6 +82,7 @@ class LLMConfig(metaclass=MetaLLMConfig):
                 modified_kwargs.pop(x)
 
         self._model = self._get_base_model_class()(**modified_kwargs)
+        self._config_list_index: int = 0
 
     # used by BaseModel to create instance variables
     def __enter__(self) -> "LLMConfig":
@@ -242,6 +243,24 @@ class LLMConfig(metaclass=MetaLLMConfig):
         d = self.model_dump()
         return d.values()
 
+    def get_configs_to_try(self) -> list["LLMConfigEntry"]:
+        """Return a list of configurations to try based on the routing method."""
+        if not self.config_list:
+            return []
+
+        if self.routing_method == "round_robin":
+            if not hasattr(self, "_config_list_index"):  # Initialize if not present (e.g. after copy)
+                self._config_list_index = 0
+            config_to_try = self.config_list[self._config_list_index]
+            self._config_list_index = (self._config_list_index + 1) % len(self.config_list)
+            return [config_to_try]
+        elif self.routing_method == "fixed_order":
+            return self.config_list
+        else:
+            # Default to fixed_order if routing_method is unknown or not set
+            # Consider logging a warning here if an invalid routing_method is provided.
+            return self.config_list
+
     _base_model_classes: dict[tuple[Type["LLMConfigEntry"], ...], Type[BaseModel]] = {}
 
     @classmethod
@@ -271,6 +290,8 @@ class LLMConfig(metaclass=MetaLLMConfig):
 
                 # Following field is configuration for pydantic to disallow extra fields
                 model_config = ConfigDict(extra="forbid")
+
+                routing_method: str = "fixed_order"
 
             LLMConfig._base_model_classes[llm_config_classes] = _LLMConfig
 
