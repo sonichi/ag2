@@ -63,6 +63,7 @@ def test_cerebras_llm_config_entry():
     )
     assert llm_config.model_dump() == {
         "config_list": [expected],
+        "routing_method": "fixed_order",
     }
 
     with pytest.raises(ValidationError) as e:

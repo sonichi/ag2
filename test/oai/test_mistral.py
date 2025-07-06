@@ -55,6 +55,7 @@ def test_mistral_llm_config_entry():
     )
     assert llm_config.model_dump() == {
         "config_list": [expected],
+        "routing_method": "fixed_order",
     }
 
 

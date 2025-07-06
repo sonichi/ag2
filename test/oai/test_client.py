@@ -466,6 +466,7 @@ def test_azure_llm_config_entry() -> None:
     )
     assert llm_config.model_dump() == {
         "config_list": [expected],
+        "routing_method": "fixed_order",
     }
 
 
@@ -492,6 +493,7 @@ def test_deepseek_llm_config_entry() -> None:
     )
     assert llm_config.model_dump() == {
         "config_list": [expected],
+        "routing_method": "fixed_order",
     }
 
     with pytest.raises(ValidationError) as e:

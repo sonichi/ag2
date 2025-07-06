@@ -212,6 +212,7 @@ OPENAI_FALLBACK_KWARGS = {
     "default_query",
     "http_client",
     "_strict_response_validation",
+    "webhook_secret",
 }
 
 AOPENAI_FALLBACK_KWARGS = {
@@ -231,6 +232,7 @@ AOPENAI_FALLBACK_KWARGS = {
     "_strict_response_validation",
     "base_url",
     "project",
+    "webhook_secret",
 }
 
 
